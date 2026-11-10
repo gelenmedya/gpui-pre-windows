@@ -57,6 +57,10 @@ pub struct WindowsPlatform {
     initial_windowing: RefCell<Option<WindowingRequest>>,
     /// Set to stop the current `VSyncProvider` thread, which runs while windowed.
     vsync_stop: RefCell<Option<Arc<AtomicBool>>>,
+    /// The first DirectX devices, being created on a helper thread while the text system and
+    /// the platform window are set up (both take long: ~200 ms for the fonts, ~170 ms for a
+    /// discrete GPU's device). Taken by the first `attach_gpu`.
+    early_devices: RefCell<Option<std::thread::JoinHandle<Result<EarlyDevices>>>>,
     // The below members will never change throughout the entire lifecycle of the app.
     /// Created with `headless()`: never windowed, and without a real text system.
     headless: bool,
@@ -181,8 +185,24 @@ impl Drop for PowerRequest {
     }
 }
 
+/// DirectX devices moved from the thread that created them.
+struct EarlyDevices(DirectXDevices);
+// SAFETY: D3D11 devices are free-threaded; the hand-off is a plain move between two threads (as
+// in `hybrid`'s pre-warmed devices).
+unsafe impl Send for EarlyDevices {}
+
 impl WindowsPlatform {
     pub fn new(headless: bool) -> Result<Self> {
+        // start on the GPU device now, alongside the rest (joined in `attach_gpu`); a headless
+        // start (no windows) just drops it
+        let early_devices = (!headless)
+            .then(|| {
+                std::thread::Builder::new()
+                    .name("gpui-devices".into())
+                    .spawn(|| DirectXDevices::new().map(EarlyDevices))
+                    .ok()
+            })
+            .flatten();
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
@@ -283,6 +303,7 @@ impl WindowsPlatform {
             raw_window_handles,
             initial_windowing: RefCell::new(None),
             vsync_stop: RefCell::new(None),
+            early_devices: RefCell::new(early_devices),
             headless,
             icon,
             background_executor,
@@ -421,7 +442,12 @@ impl WindowsPlatform {
 
     /// Creates the DirectX devices that windows draw with, and starts vsync.
     fn attach_gpu(&self) -> Result<()> {
-        let devices = DirectXDevices::new().context("Creating DirectX devices")?;
+        let early = self.early_devices.borrow_mut().take().and_then(|t| t.join().ok());
+        let devices = match early {
+            Some(Ok(EarlyDevices(d))) => d,
+            // (failed or panicked on the helper thread: try once more here)
+            _ => DirectXDevices::new().context("Creating DirectX devices")?,
+        };
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.handle_gpu_lost(&devices)?;
         }
