@@ -80,6 +80,15 @@ impl WindowsDisplay {
         DisplayId::new(monitor.0 as u64)
     }
 
+    /// The monitor `bounds` (logical pixels of that monitor) sit on: the one holding their
+    /// center.
+    pub(crate) fn for_bounds(bounds: Bounds<Pixels>) -> Option<Self> {
+        available_monitors()
+            .into_iter()
+            .filter_map(|m| Self::new(Self::display_id_for_monitor(m)))
+            .find(|d| d.check_given_bounds(bounds))
+    }
+
     pub fn primary_monitor() -> Option<Self> {
         // https://devblogs.microsoft.com/oldnewthing/20070809-00/?p=25643
         const POINT_ZERO: POINT = POINT { x: 0, y: 0 };

@@ -540,10 +540,12 @@ impl WindowsWindow {
         }
 
         let hinstance = get_module_handle();
+        // no display given: the one the bounds are on (a menu or popup opened at a point on a
+        // second monitor); the primary display put it at its default place and size there
         let display = if let Some(display_id) = params.display_id {
             WindowsDisplay::new(display_id)
         } else {
-            None
+            WindowsDisplay::for_bounds(params.bounds)
         }
         .or_else(WindowsDisplay::primary_monitor)
         .context("failed to find any monitor")?;
