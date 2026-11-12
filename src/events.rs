@@ -308,6 +308,8 @@ impl WindowsWindowInner {
         }
 
         self.handle_size_change(new_size, scale_factor, should_resize_renderer);
+        // a window that was minimized asked for no frames (see `demand::request_for`): back on screen, it gets one
+        crate::demand::request();
         Some(0)
     }
 
@@ -1379,6 +1381,8 @@ impl WindowsWindowInner {
         self.report_visibility();
         if wparam.0 == 1 {
             self.draw_window(handle, false);
+            // a window that was hidden asked for no frames (see `demand::request_for`); what it has pending is drawn from here on
+            crate::demand::request();
         }
         None
     }

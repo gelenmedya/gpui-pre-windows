@@ -667,11 +667,13 @@ impl Drop for WindowsWindow {
 impl PlatformWindow for WindowsWindow {
     // rustyfiles fork: demand-driven frames (see demand.rs).
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
-        Some(Rc::new(crate::demand::request))
+        // only the handle is captured: the waker is kept by the window's own invalidator
+        let hwnd = self.0.hwnd;
+        Some(Rc::new(move || crate::demand::request_for(hwnd)))
     }
 
     fn schedule_frame(&self) {
-        crate::demand::request();
+        crate::demand::request_for(self.0.hwnd);
     }
 
     fn bounds(&self) -> Bounds<Pixels> {

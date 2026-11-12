@@ -33,6 +33,21 @@ pub(crate) fn request() {
     }
 }
 
+/// A frame wanted by one window. A window that is not being presented (hidden or minimized) is not sent `WM_PAINT`, so a frame it
+/// asks for can never be drawn and it stays dirty; GPUI's core asks again for every dirty window at the end of every effect cycle,
+/// and each of those asks made the vsync thread invalidate all windows, whose paint messages ended in the next effect cycle: the
+/// UI thread and the vsync thread turned at the display's rate for as long as such a window existed. Measured in rustyfiles' dock
+/// with one hidden pop-up window: about 530 wake-ups a second of the UI thread and 3 % of a core on an idle desktop, against 16 ms
+/// of CPU in 6 s without it. Such a window therefore asks for nothing; it is drawn when it is shown or restored (`WM_SHOWWINDOW`
+/// and `WM_SIZE` ask for a frame themselves).
+pub(crate) fn request_for(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+    let presented = unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() };
+    if presented {
+        request();
+    }
+}
+
 /// Called by the vsync thread each iteration: returns true when windows should be invalidated.
 pub(crate) fn take() -> bool {
     if continuous() {
