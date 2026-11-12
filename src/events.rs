@@ -477,6 +477,20 @@ impl WindowsWindowInner {
                 .set(Some(callback));
         }
 
+        // The elements learn that the pointer is gone from this event alone: Windows sends a window no last move when the pointer
+        // leaves it, and GPUI's core clears an element's hover on `MouseExited` for exactly that reason. This layer never sent it, so
+        // whatever was under the pointer stayed hovered for as long as the pointer was away (rustyfiles' dock: its icons stayed
+        // magnified, and a hover preview never came back for the icon the pointer had last been on).
+        if let Some(mut func) = self.state.callbacks.input.take() {
+            let input = PlatformInput::MouseExited(MouseExitEvent {
+                position: self.state.mouse_position.get(),
+                pressed_button: None,
+                modifiers: current_modifiers(),
+            });
+            func(input);
+            self.state.callbacks.input.set(Some(func));
+        }
+
         Some(0)
     }
 
