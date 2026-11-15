@@ -1200,7 +1200,14 @@ impl WindowsWindowInner {
             let handled = !func(input).propagate;
             self.state.callbacks.input.set(Some(func));
 
-            if handled {
+            // A press or a release on one of the three caption buttons is acted on whatever the app answered. The answer is
+            // "handled" (no propagation) also when the event could NOT be dispatched at all: the app is borrowed at that moment
+            // ("dispatching input for window ...: RefCell already borrowed" in the log) and the callback gives the default
+            // result, whose `propagate` is false. The click was then swallowed here, and the window's close button did nothing
+            // until it was clicked again (rustyfiles issue 31: "App requires clicking the close button twice", with exactly that
+            // line in the log before each second click). An element under a caption button has nothing to say about it either:
+            // the area was declared a window control.
+            if handled && !is_caption_button(button, wparam) {
                 return Some(0);
             }
         } else {
@@ -1244,7 +1251,8 @@ impl WindowsWindowInner {
             let handled = !func(input).propagate;
             self.state.callbacks.input.set(Some(func));
 
-            if handled {
+            // (the same as for the press: see `handle_nc_mouse_down_msg`)
+            if handled && !is_caption_button(button, wparam) {
                 return Some(0);
             }
         } else {
@@ -1984,4 +1992,9 @@ fn notify_frame_changed(handle: HWND) {
         )
         .log_err();
     }
+}
+
+/// Whether a non-client mouse message is the left button on the minimize, maximize or close button.
+fn is_caption_button(button: MouseButton, wparam: WPARAM) -> bool {
+    button == MouseButton::Left && matches!(wparam.0 as u32, HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
 }
