@@ -17,6 +17,7 @@ pub mod dnd_hint;
 pub mod hybrid;
 mod keyboard;
 mod platform;
+mod reentry;
 mod system_notifications;
 mod system_settings;
 mod util;

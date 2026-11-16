@@ -28,6 +28,8 @@ pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
 pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
+/// The window reads its size and place again and tells the app (see `reentry`).
+pub(crate) const WM_GPUI_REPLAY_BOUNDS: u32 = WM_USER + 11;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
@@ -132,6 +134,12 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // The app is in the middle of a task and cannot take this now (see `reentry`): the pointer's messages and the "read your
+        // bounds again" note are kept and come back when the task has ended.
+        if crate::reentry::in_task() && (crate::reentry::is_mouse_message(msg) || msg == WM_GPUI_REPLAY_BOUNDS) {
+            crate::reentry::keep(handle, msg, wparam, lparam);
+            return LRESULT(0);
+        }
         let handled = match msg {
             // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
             // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
@@ -148,8 +156,21 @@ impl WindowsWindowInner {
             }
             WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
-            WM_MOVE => self.handle_move_msg(handle, lparam),
-            WM_SIZE => self.handle_size_msg(wparam, lparam),
+            WM_MOVE => {
+                let r = self.handle_move_msg(handle, lparam);
+                if crate::reentry::in_task() {
+                    crate::reentry::note_bounds(handle);
+                }
+                r
+            }
+            WM_SIZE => {
+                let r = self.handle_size_msg(wparam, lparam);
+                if crate::reentry::in_task() {
+                    crate::reentry::note_bounds(handle);
+                }
+                r
+            }
+            WM_GPUI_REPLAY_BOUNDS => self.handle_replay_bounds(handle),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(handle, lparam),
             WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
             WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
@@ -334,6 +355,26 @@ impl WindowsWindowInner {
             callback(new_logical_size, scale_factor);
             self.state.callbacks.resize.set(Some(callback));
         }
+    }
+
+    /// The size and the place were changed while the app was in a task and may not have reached it (see `reentry`): they are read
+    /// from the window and told again, now that nothing is borrowed. The same size told twice changes nothing.
+    fn handle_replay_bounds(&self, handle: HWND) -> Option<isize> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic};
+        let mut rc = RECT::default();
+        // SAFETY: plain reads of a window's state.
+        let readable = unsafe { !IsIconic(handle).as_bool() && GetClientRect(handle, &mut rc).is_ok() };
+        if readable && rc.right > 0 && rc.bottom > 0 {
+            let device = size(DevicePixels(rc.right), DevicePixels(rc.bottom));
+            self.handle_size_change(device, self.state.scale_factor.get(), true);
+        }
+        if let Some(mut callback) = self.state.callbacks.moved.take() {
+            callback();
+            self.state.callbacks.moved.set(Some(callback));
+        }
+        crate::demand::request();
+        Some(0)
     }
 
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
