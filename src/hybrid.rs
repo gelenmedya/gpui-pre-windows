@@ -12,7 +12,8 @@
 //!
 //! Configuration (read once, at first device creation):
 //! * `RUSTYFILES_RENDERER=auto|gpu|cpu` (default `auto`)
-//! * `RUSTYFILES_FAST_START=1` (open on WARP first in `auto`, then hot-swap to the GPU; off by default)
+//! * `RUSTYFILES_FAST_START=1|0` (in `auto`: open on WARP and let the GPU device take over the moment it exists, or open straight
+//!   on the GPU; without it the app decides with [`set_fast_start`], and an app that says nothing opens on the GPU)
 //! * `RUSTYFILES_FRAME_LOG=1` (debug: log a frame-time histogram line every 2 s; a file path instead of 1 also appends raw samples there)
 //! * `RUSTYFILES_RENDERER_FLIP_SECS=N` (debug: force a switch every N seconds while in `auto`)
 
@@ -249,9 +250,8 @@ pub(crate) fn desired_backend_for_new_devices() -> RendererBackend {
         RendererMode::Cpu => RendererBackend::Cpu,
         RendererMode::Gpu => RendererBackend::Gpu,
         RendererMode::Auto if fast_start_enabled() => {
-            // Fast start: WARP is ready ~190 ms sooner than a discrete GPU device. Open on the
-            // CPU, then hot-swap to the GPU (pre-warmed off-thread) once the monitor sees it is
-            // not busy. If the GPU is saturated at launch (game/render), we never touch it.
+            // Fast start: WARP is ready in a millisecond, a discrete GPU's device in about 110. Open on the CPU; the monitor
+            // makes the GPU device at once, off this thread, and hands it over as soon as it exists (`monitor_main`).
             FAST_START.store(true, Ordering::Relaxed);
             HW_AVAILABLE.store(true, Ordering::Relaxed);
             RendererBackend::Cpu
@@ -262,13 +262,43 @@ pub(crate) fn desired_backend_for_new_devices() -> RendererBackend {
 
 static FAST_START: AtomicBool = AtomicBool::new(false);
 
-/// Off by default: opening on WARP saves ~190 ms of window time but costs seconds of CPU on
-/// every core until the hot-swap (measured: ~4 s of CPU time at launch against ~0.8 s on the
-/// GPU). Auto opens on the GPU when a hardware adapter works (device creation falls back to
-/// WARP when none does) and still moves to WARP while the GPU is saturated.
-/// `RUSTYFILES_FAST_START=1` turns it back on.
+/// The app's word on the fast start (0: none, 1: on, 2: off). See [`set_fast_start`].
+static FAST_START_HINT: AtomicU8 = AtomicU8::new(0);
+
+/// How long the hardware device took to make in this process, in ms (0: not made yet).
+static GPU_DEVICE_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Asks for the fast start (or against it), before the platform is created. For an app that knows this machine: it pays where the
+/// GPU's device is slow to make (a discrete card's 110 ms), not where it takes a few ms. [`gpu_device_ms`] is what to remember.
+pub fn set_fast_start(on: bool) {
+    FAST_START_HINT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// How long the hardware device took to make in this process (ms): at start when the app opened on the GPU, or when the fast
+/// start made it. `None` until then, and where no hardware adapter works.
+pub fn gpu_device_ms() -> Option<u32> {
+    Some(GPU_DEVICE_MS.load(Ordering::Relaxed)).filter(|ms| *ms > 0)
+}
+
+pub(crate) fn note_gpu_device(took: Duration) {
+    GPU_DEVICE_MS.store((took.as_millis() as u32).max(1), Ordering::Relaxed);
+}
+
+/// Whether Auto opens on WARP: `RUSTYFILES_FAST_START=1` or `0` decides, else the app's word ([`set_fast_start`]), else no.
+///
+/// HISTORY. The first fast start (2026-11-05) opened on WARP and moved to the GPU at the monitor's first tick, half a second
+/// later and only if the GPU was not busy: WARP drew every frame of the first second on every core (about 4 s of CPU time at
+/// launch against 0.8 s on the GPU), so it was switched off on 2026-11-09 and Auto opened on the GPU, waiting about 110 ms for
+/// its device before the first window. Now the GPU device is made the moment the monitor starts and handed over as soon as it
+/// exists, so WARP draws the first frame or two and no more (see `monitor_main`). What is given up: the look at the GPU's load
+/// before it is touched at launch. That is what opening on the GPU did too, and the policy still moves to WARP while the GPU is
+/// saturated.
 fn fast_start_enabled() -> bool {
-    std::env::var("RUSTYFILES_FAST_START").is_ok_and(|v| v.trim() == "1")
+    match std::env::var("RUSTYFILES_FAST_START").ok().as_deref().map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => FAST_START_HINT.load(Ordering::Relaxed) == 1,
+    }
 }
 
 pub(crate) fn set_current_backend(backend: RendererBackend) {
@@ -460,7 +490,39 @@ impl Policy {
 
 const TICK: Duration = Duration::from_millis(500);
 
+/// Makes a device of the other kind here, off the UI and vsync threads, while the old one keeps drawing, and leaves it for the
+/// vsync thread to swap in. Says whether one was left.
+fn prewarm_and_offer(target: RendererBackend) -> bool {
+    let started = Instant::now();
+    match DirectXDevices::create_prewarmed(target) {
+        Ok(devices) => {
+            log::info!("pre-warmed {} device in {:?}", target.label(), started.elapsed());
+            SWITCH_IN_FLIGHT.store(true, Ordering::Release);
+            *PENDING.lock() = Some(SendDevices(devices));
+            true
+        }
+        Err(err) => {
+            log::error!("could not create {} device: {err:#}", target.label());
+            if target == RendererBackend::Gpu {
+                HW_AVAILABLE.store(false, Ordering::Relaxed);
+            }
+            false
+        }
+    }
+}
+
 fn monitor_main() {
+    // Fast start: the window opened on WARP. The GPU's device is made NOW, before anything else this thread does (opening the
+    // load counters takes a while), and offered at once: there is no load to look at yet, and waiting for the first tick is what
+    // made WARP draw a whole second of frames.
+    if FAST_START.load(Ordering::Relaxed)
+        && current_backend() == Some(RendererBackend::Cpu)
+        && RendererMode::from_u8(MODE.load(Ordering::Relaxed)) == RendererMode::Auto
+    {
+        FAST_START.store(false, Ordering::Relaxed);
+        log::info!("renderer switch requested: CPU -> GPU (fast start: the hardware device as soon as it exists)");
+        prewarm_and_offer(RendererBackend::Gpu);
+    }
     let mut gpu_counter = GpuCounter::open();
     if gpu_counter.is_none() {
         log::warn!("GPU utilization counter unavailable; auto mode relies on frame times only");
@@ -566,22 +628,7 @@ fn monitor_main() {
         policy.note_switch(now);
         last_flip = now;
 
-        // Pre-warm: create the other device (and its pipelines) here, off the UI/vsync threads,
-        // while the old device keeps drawing.
-        let started = Instant::now();
-        match DirectXDevices::create_prewarmed(target) {
-            Ok(devices) => {
-                log::info!("pre-warmed {} device in {:?}", target.label(), started.elapsed());
-                SWITCH_IN_FLIGHT.store(true, Ordering::Release);
-                *PENDING.lock() = Some(SendDevices(devices));
-            }
-            Err(err) => {
-                log::error!("could not create {} device: {err:#}", target.label());
-                if target == RendererBackend::Gpu {
-                    HW_AVAILABLE.store(false, Ordering::Relaxed);
-                }
-            }
-        }
+        prewarm_and_offer(target);
     }
 }
 

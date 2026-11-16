@@ -93,8 +93,13 @@ impl DirectXDevices {
 
         let mut created = None;
         if backend == RendererBackend::Gpu {
+            let started = std::time::Instant::now();
             match get_hardware_adapter(&dxgi_factory, debug_layer_available) {
-                Ok(c) => created = Some((RendererBackend::Gpu, c)),
+                Ok(c) => {
+                    // (what an app remembers to decide on the fast start: see `hybrid::gpu_device_ms`)
+                    hybrid::note_gpu_device(started.elapsed());
+                    created = Some((RendererBackend::Gpu, c))
+                }
                 Err(err) => {
                     log::warn!("No usable hardware adapter ({err:#}); falling back to WARP");
                     hybrid::set_hardware_available(false);

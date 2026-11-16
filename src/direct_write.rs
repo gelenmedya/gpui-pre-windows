@@ -194,11 +194,15 @@ impl DirectWriteTextSystem {
             system_subpixel_rendering,
         };
 
+        // rustyfiles fork: WITHOUT the check for updates. With it, DirectWrite compares the installed fonts with its cache before
+        // it answers, on this (the main) thread, before the first window: 100 ms of a cold start on a machine with 1,800 fonts
+        // (measured 2026-11-16: 4 ms -> 108 ms into the platform's start; 5 ms without the check). The collection is the one
+        // Windows' font cache service keeps, so a font installed the usual way is in it at the next start of the app.
         let system_font_collection = unsafe {
             let mut result = None;
             components
                 .factory
-                .GetSystemFontCollection(false, &mut result, true)?;
+                .GetSystemFontCollection(false, &mut result, false)?;
             result.context("Failed to get system font collection")?
         };
         let custom_font_set = unsafe { components.builder.CreateFontSet()? };

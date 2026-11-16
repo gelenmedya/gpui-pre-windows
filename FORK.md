@@ -115,11 +115,24 @@ the vsync thread only invalidates when GPUI signals a dirty window / animation f
 Measured (debug build, idle window): 203 ms CPU per 10 s → 31 ms per 10 s.
 `RUSTYFILES_CONTINUOUS_FRAMES=1` restores upstream behaviour for comparison.
 
-## Fast start (hybrid.rs) — off by default since 2026-11-09
-Opt-in with `RUSTYFILES_FAST_START=1`. It made the window appear sooner but WARP drew the first
-frames on every core until the hot-swap: ~4 s of CPU time at launch against ~0.8 s when Auto opens
-straight on the GPU (rustyfiles' speed test showed it as a CPU column worse than Explorer's).
-Auto now opens on the hardware adapter when one works and falls back to WARP when none does.
+## Fast start (hybrid.rs) — a new form since 2026-11-16, asked for by the app
+The app asks for it with `hybrid::set_fast_start(true)` before the platform is created
+(`RUSTYFILES_FAST_START=1|0` overrides); an app that says nothing opens on the GPU as before.
+rustyfiles asks for it where the GPU device took 60 ms or more the last time (`gpu_device_ms()`,
+remembered between starts). With it, Auto's first device is WARP (ready in a millisecond; the NVIDIA
+device takes about 110 ms), and the monitor thread makes the GPU device the moment it starts and
+offers it at once, so WARP draws for about a tenth of a second.
+
+Measured on one machine (Ryzen 7 9800X3D, RTX 5070 Ti, a build without LTO, medians of four cold
+starts): first window 310 ms -> 199 ms after the process started; CPU time 1.8 s after the start
+0.74 s -> 1.25 s; private memory 87 -> 89 MB; the switch takes about 20 ms on the message loop and
+leaves no difference in the window's picture.
+
+History: the first form (2026-11-05) waited for the monitor's first tick, half a second in, and for
+a GPU that was not busy. WARP drew every frame of the first second on every core: ~4 s of CPU time
+at launch against ~0.8 s when Auto opens straight on the GPU (rustyfiles' speed test showed it as a
+CPU column worse than Explorer's), so it was off by default from 2026-11-09 to 2026-11-16. The text
+below describes that first form's switch; the swap itself is the same.
 
 When enabled: in Auto mode the first device is WARP (ready ~190 ms sooner than the NVIDIA device). The monitor's
 first tick hot-swaps to the GPU if it is not busy (pre-warmed off-thread, ~13 ms on the message
