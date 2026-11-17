@@ -153,3 +153,11 @@ rule is now a real signal. Slow frames are logged at debug level (`gpui_windows:
 ## Acrylic popups (2026-11-05)
 - `WindowBackgroundAppearance::Blurred` → Windows 11 system Acrylic (`DWMSBT_TRANSIENTWINDOW`) with `DWMWCP_ROUNDSMALL` corners on build ≥ 22621; legacy blur otherwise (window.rs `dwm_acrylic`).
 - `KEEP_ACTIVE_LOOK` (exported): while set, `WM_NCACTIVATE(FALSE)` is answered as active, so the owner keeps its active frame / Mica while an app popup menu has focus (events.rs).
+
+## Right-to-left glyph runs (`src/direct_write.rs`, 2026-11-17)
+Contributed by ialhabbal (rustyfiles PR 58, issue 39: Persian, Arabic and Hebrew names read backwards). DirectWrite hands a
+glyph run of a right-to-left bidi level (`bidiLevel` odd) with its origin on the RIGHT, and its glyphs advance toward the
+LEFT. The run callback placed every glyph at `width + advanceOffset`, left to right, so the letters of an RTL word came out
+in reverse order. Now an RTL run keeps a pen at the baseline origin and moves it left by each glyph's advance, placing the
+glyph at `pen - advance - advanceOffset`; an LTR run is placed as before. The line's measured width is unchanged (it adds
+the advances either way).

@@ -1577,7 +1577,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
     fn DrawGlyphRun(
         &self,
         clientdrawingcontext: *const ::core::ffi::c_void,
-        _baselineoriginx: f32,
+        baseline_origin_x: f32,
         _baselineoriginy: f32,
         _measuringmode: DWRITE_MEASURING_MODE,
         glyphrun: *const DWRITE_GLYPH_RUN,
@@ -1665,6 +1665,9 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
         let mut utf16_idx = desc.textPosition as usize;
         let mut glyph_idx = 0;
+        // DirectWrite starts RTL runs on the right and advances toward the left.
+        let is_rtl = glyphrun.bidiLevel & 1 != 0;
+        let mut pen_x = baseline_origin_x;
         let mut glyphs = Vec::with_capacity(glyph_count);
         for (cluster_utf16_len, cluster_glyph_count) in cluster_analyzer {
             context.index_converter.advance_to_utf16_ix(utf16_idx);
@@ -1678,16 +1681,24 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                 let is_emoji =
                     color_font && is_color_glyph(font_face, id, &context.components.factory);
                 let this_glyph_idx = glyph_idx + cluster_glyph_idx;
+                let advance = glyph_advances[this_glyph_idx];
+                let advance_offset = glyph_offsets[this_glyph_idx].advanceOffset;
                 glyphs.push(ShapedGlyph {
                     id,
                     position: point(
-                        px(context.width + glyph_offsets[this_glyph_idx].advanceOffset),
+                        px(if is_rtl {
+                            pen_x - advance - advance_offset
+                        } else {
+                            pen_x + advance_offset
+                        }),
                         px(-glyph_offsets[this_glyph_idx].ascenderOffset),
                     ),
                     index: context.index_converter.utf8_ix,
                     is_emoji,
                 });
-                context.width += glyph_advances[this_glyph_idx];
+                let direction = if is_rtl { -1.0 } else { 1.0 };
+                pen_x += direction * advance;
+                context.width += advance;
             }
             glyph_idx += cluster_glyph_count;
         }
