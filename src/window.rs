@@ -1243,8 +1243,9 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             let idata_obj = pdataobj.ok()?;
             let cursor_position = POINT { x: pt.x, y: pt.y };
             if let Some(paths) = read_hdrop_paths(idata_obj) {
-                // rustyfiles fork: app-chosen effect (see dnd_hint.rs)
-                *pdweffect = crate::dnd_hint::effect_for(grfkeystate);
+                // rustyfiles fork: app-chosen effect, one the source allows (see dnd_hint.rs)
+                crate::dnd_hint::set_allowed(*pdweffect);
+                *pdweffect = crate::dnd_hint::choose(grfkeystate, *pdweffect);
                 *self.1.borrow_mut() = paths.clone();
                 let mut cursor_position = cursor_position;
                 ScreenToClient(self.0.hwnd, &mut cursor_position)
@@ -1279,8 +1280,9 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            // rustyfiles fork: app-chosen effect (see dnd_hint.rs)
-            *pdweffect = crate::dnd_hint::effect_for(grfkeystate);
+            // rustyfiles fork: app-chosen effect, one the source allows (see dnd_hint.rs)
+            crate::dnd_hint::set_allowed(*pdweffect);
+            *pdweffect = crate::dnd_hint::choose(grfkeystate, *pdweffect);
             self.0
                 .drop_target_helper
                 .DragOver(&cursor_position, *pdweffect)
@@ -1306,6 +1308,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         unsafe {
             self.0.drop_target_helper.DragLeave().log_err();
         }
+        crate::dnd_hint::clear_allowed();
         let input = PlatformInput::FileDrop(FileDropEvent::Exited);
         self.handle_drag_drop(input);
 
@@ -1322,7 +1325,9 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
+            // (COPY on purpose: the application does the copy or move itself, see dnd_hint.rs; MOVE only where the source allows
+            // nothing else)
+            *pdweffect = crate::dnd_hint::for_drop(*pdweffect);
             self.0
                 .drop_target_helper
                 .Drop(idata_obj, &cursor_position, *pdweffect)
@@ -1359,7 +1364,9 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 scale_factor,
             ),
         });
+        // (the application reads `dnd_hint::allowed()` while it handles the drop, inside this call)
         self.handle_drag_drop(input);
+        crate::dnd_hint::clear_allowed();
 
         Ok(())
     }
