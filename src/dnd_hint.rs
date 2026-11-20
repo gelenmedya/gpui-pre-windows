@@ -90,3 +90,22 @@ pub(crate) fn effect_for(keys: MODIFIERKEYS_FLAGS) -> DROPEFFECT {
         DROPEFFECT(HINT.load(Ordering::Relaxed))
     }
 }
+
+/// rustyfiles fork: a drag that carries no file paths, only files held inside the source ("virtual files": a mail's attachment,
+/// an image dragged out of a browser). Upstream refuses such a drag. The application can register a reader that turns one into
+/// paths: while the drag is over a window it is asked with `fetch == false` for the paths the files WILL have (nothing is written
+/// yet, the drop handlers only look at them), and at the drop with `fetch == true`, when it writes the files and gives their real
+/// paths. `data` is the drag's `IDataObject`, borrowed for the call (a raw pointer, so the application may use its own `windows`
+/// crate). `None`: the drag carries nothing the reader takes, and it is refused as before.
+pub type VirtualReader = fn(data: *mut std::ffi::c_void, fetch: bool) -> Option<Vec<std::path::PathBuf>>;
+
+static VIRTUAL: std::sync::OnceLock<VirtualReader> = std::sync::OnceLock::new();
+
+/// Registers the reader of virtual files (once; a second call is ignored).
+pub fn set_virtual_reader(reader: VirtualReader) {
+    let _ = VIRTUAL.set(reader);
+}
+
+pub(crate) fn read_virtual(data: *mut std::ffi::c_void, fetch: bool) -> Option<Vec<std::path::PathBuf>> {
+    VIRTUAL.get().and_then(|r| r(data, fetch)).filter(|p| !p.is_empty())
+}

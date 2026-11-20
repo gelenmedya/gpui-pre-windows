@@ -1221,6 +1221,15 @@ unsafe fn read_hdrop_paths(idata_obj: &IDataObject) -> Option<SmallVec<[PathBuf;
     }
 }
 
+/// rustyfiles fork: the paths a drag carries: its `CF_HDROP` paths, or else what the application's reader of virtual files makes
+/// of it (see `dnd_hint::set_virtual_reader`; `fetch` at the drop, when the files are written).
+unsafe fn read_drag_paths(idata_obj: &IDataObject, fetch: bool) -> Option<SmallVec<[PathBuf; 2]>> {
+    if let Some(paths) = unsafe { read_hdrop_paths(idata_obj) } {
+        return Some(paths);
+    }
+    crate::dnd_hint::read_virtual(idata_obj.as_raw(), fetch).map(SmallVec::from_vec)
+}
+
 impl WindowsDragDropHandler {
     fn handle_drag_drop(&self, input: PlatformInput) {
         if let Some(mut func) = self.0.state.callbacks.input.take() {
@@ -1242,7 +1251,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         unsafe {
             let idata_obj = pdataobj.ok()?;
             let cursor_position = POINT { x: pt.x, y: pt.y };
-            if let Some(paths) = read_hdrop_paths(idata_obj) {
+            if let Some(paths) = read_drag_paths(idata_obj, false) {
                 // rustyfiles fork: app-chosen effect, one the source allows (see dnd_hint.rs)
                 crate::dnd_hint::set_allowed(*pdweffect);
                 *pdweffect = crate::dnd_hint::choose(grfkeystate, *pdweffect);
@@ -1345,7 +1354,8 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         // rustyfiles fork: some sources hand out final paths only once the mouse button is up.
         // WinRAR gives a bare file name during DragEnter and extracts into %TEMP%\Rar$DRa…
         // only when CF_HDROP is read at drop time, so read it again and swap in the new paths.
-        let fresh = unsafe { read_hdrop_paths(idata_obj) };
+        // (a drag of virtual files is written now: its files get their real paths here)
+        let fresh = unsafe { read_drag_paths(idata_obj, true) };
         if let Some(fresh) = fresh {
             let changed = *self.1.borrow() != fresh;
             if changed {
