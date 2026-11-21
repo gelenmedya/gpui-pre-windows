@@ -1188,6 +1188,33 @@ impl WindowsWindowInner {
             } as _);
         }
 
+        // rustyfiles: on Windows 10 the left, right and bottom edges are also a band just inside the window. There the borders
+        // outside it, which `DefWindowProcW` answers, did not resize (a user, rustyfiles issue 176: "the resize arrow doesn't
+        // appear at all" at the right, left and bottom edges on Windows 10; the top, which is answered above, did). Windows 11
+        // keeps its outside borders only, so nothing inside the window (a scroll bar at its edge) is taken there.
+        if self.is_resizable && !self.state.is_maximized() && before_windows_11() {
+            let mut client = RECT::default();
+            if unsafe { GetClientRect(handle, &mut client) }.is_ok() {
+                let band = (4 * dpi as i32 / USER_DEFAULT_SCREEN_DPI as i32).max(3);
+                let (left, right) = (cursor_point.x < band, cursor_point.x >= client.right - band);
+                let bottom = cursor_point.y >= client.bottom - band && cursor_point.y < client.bottom;
+                let inside = cursor_point.x >= 0 && cursor_point.x < client.right && cursor_point.y >= 0;
+                if inside {
+                    let edge = match (left, right, bottom) {
+                        (true, _, true) => Some(HTBOTTOMLEFT),
+                        (_, true, true) => Some(HTBOTTOMRIGHT),
+                        (true, _, _) => Some(HTLEFT),
+                        (_, true, _) => Some(HTRIGHT),
+                        (_, _, true) => Some(HTBOTTOM),
+                        _ => None,
+                    };
+                    if let Some(edge) = edge {
+                        return Some(edge as _);
+                    }
+                }
+            }
+        }
+
         drag_area
     }
 
@@ -2038,4 +2065,15 @@ fn notify_frame_changed(handle: HWND) {
 /// Whether a non-client mouse message is the left button on the minimize, maximize or close button.
 fn is_caption_button(button: MouseButton, wparam: WPARAM) -> bool {
     button == MouseButton::Left && matches!(wparam.0 as u32, HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
+}
+
+/// rustyfiles: whether this is a Windows before 11 (build 22000), read once.
+fn before_windows_11() -> bool {
+    static BEFORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BEFORE.get_or_init(|| {
+        let mut version = unsafe { std::mem::zeroed() };
+        let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+        // (`RUSTYFILES_PRETEND_WINDOWS_10=1`: the Windows 10 behaviour on a later Windows, for a try)
+        std::env::var_os("RUSTYFILES_PRETEND_WINDOWS_10").is_some() || (status.is_ok() && version.dwBuildNumber < 22000)
+    })
 }
