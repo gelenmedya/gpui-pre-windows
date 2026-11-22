@@ -88,6 +88,11 @@ pub struct WindowsWindowState {
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     fullscreen: Cell<Option<StyleAndBounds>>,
     initial_placement: Cell<Option<WindowOpenStatus>>,
+    /// rustyfiles: the window is being put at the place it was opened with (`SetWindowPlacement` at its creation). That place is in
+    /// the target display's own pixels, so a DPI change it causes keeps it instead of taking Windows' suggested rectangle, which is
+    /// scaled from the monitor the window was made on (a menu opened on a 100 % monitor beside a 150 % primary came out at 2/3 of its
+    /// size, its submenu standing apart from it: rustyfiles issue 191).
+    pub(crate) placing: Cell<bool>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
     pub mouse_position: Cell<Point<Pixels>>,
@@ -209,6 +214,7 @@ impl WindowsWindowState {
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
+            placing: Cell::new(false),
             hwnd,
             invalidate_devices,
             draw_coordinator,
@@ -607,7 +613,12 @@ impl WindowsWindow {
             if !params.focus {
                 placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
             }
-            unsafe { SetWindowPlacement(hwnd, &placement)? };
+            this.state.placing.set(true);
+            let placed = unsafe { SetWindowPlacement(hwnd, &placement) };
+            this.state.placing.set(false);
+            placed?;
+            // (the size is told again with the scale of the display it is on now)
+            this.handle_replay_bounds(hwnd);
         } else {
             this.state.initial_placement.set(Some(WindowOpenStatus {
                 placement,

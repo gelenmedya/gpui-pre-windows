@@ -359,7 +359,7 @@ impl WindowsWindowInner {
 
     /// The size and the place were changed while the app was in a task and may not have reached it (see `reentry`): they are read
     /// from the window and told again, now that nothing is borrowed. The same size told twice changes nothing.
-    fn handle_replay_bounds(&self, handle: HWND) -> Option<isize> {
+    pub(crate) fn handle_replay_bounds(&self, handle: HWND) -> Option<isize> {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic};
         let mut rc = RECT::default();
@@ -1047,7 +1047,9 @@ impl WindowsWindowInner {
             .direct_manipulation
             .set_scale_factor(new_scale_factor);
 
-        if is_maximized {
+        if self.state.placing.get() {
+            // rustyfiles: put where it was opened, in this display's pixels: the rectangle stays (see `placing`)
+        } else if is_maximized {
             // Get the monitor and its work area at the new DPI
             let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
             let mut monitor_info: MONITORINFO = unsafe { std::mem::zeroed() };
