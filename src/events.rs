@@ -47,6 +47,50 @@ struct Smooth {
 
 thread_local! {
     static SMOOTH: std::cell::RefCell<std::collections::HashMap<isize, Smooth>> = Default::default();
+    /// rustyfiles: each window's finger (see `touch_pan`), and the scroll that runs out after a swipe.
+    static TOUCH: std::cell::RefCell<std::collections::HashMap<isize, crate::touch_pan::Pan>> = Default::default();
+    static FLING: std::cell::RefCell<std::collections::HashMap<isize, TouchFling>> = Default::default();
+}
+
+/// A swipe's scroll running out: where the finger came down, and when the last step was made.
+struct TouchFling {
+    fling: crate::touch_pan::Fling,
+    position: Point<Pixels>,
+    scale_factor: f32,
+    last: std::time::Instant,
+}
+
+/// Milliseconds on a clock that only goes forward (for the finger's speed).
+fn touch_now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// The next slice of a swipe's fling for `handle`, if one runs.
+fn fling_step(handle: HWND) -> Option<PlatformInput> {
+    FLING.with(|m| {
+        let mut m = m.borrow_mut();
+        let key = handle.0 as isize;
+        let f = m.get_mut(&key)?;
+        let now = std::time::Instant::now();
+        let dt = (now - f.last).as_secs_f32().clamp(0.001, 0.05);
+        f.last = now;
+        let (position, scale_factor) = (f.position, f.scale_factor);
+        let (way, phase) = match f.fling.step(dt) {
+            Some(way) => (way, TouchPhase::Moved),
+            None => {
+                m.remove(&key);
+                (0.0, TouchPhase::Ended)
+            }
+        };
+        Some(PlatformInput::Scroll(ScrollEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(way / scale_factor))),
+            modifiers: current_modifiers(),
+            touch_phase: phase,
+            source: ScrollSource::Pointer,
+        }))
+    })
 }
 
 /// Time constant of the exponential ease-out (≈95 % of a notch within 3τ).
@@ -182,7 +226,7 @@ impl WindowsWindowInner {
             WM_PAINT => self.handle_paint_msg(handle),
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
-            WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
+            WM_MOUSEMOVE => self.handle_touch_move(handle, lparam, wparam),
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
@@ -206,13 +250,13 @@ impl WindowsWindowInner {
             WM_NCMBUTTONUP => {
                 self.handle_nc_mouse_up_msg(handle, MouseButton::Middle, wparam, lparam)
             }
-            WM_LBUTTONDOWN => self.handle_mouse_down_msg(handle, MouseButton::Left, lparam),
+            WM_LBUTTONDOWN => self.handle_touch_press(handle, lparam),
             WM_RBUTTONDOWN => self.handle_mouse_down_msg(handle, MouseButton::Right, lparam),
             WM_MBUTTONDOWN => self.handle_mouse_down_msg(handle, MouseButton::Middle, lparam),
             WM_XBUTTONDOWN => {
                 self.handle_xbutton_msg(handle, wparam, lparam, Self::handle_mouse_down_msg)
             }
-            WM_LBUTTONUP => self.handle_mouse_up_msg(handle, MouseButton::Left, lparam),
+            WM_LBUTTONUP => self.handle_touch_release(handle, lparam),
             WM_RBUTTONUP => self.handle_mouse_up_msg(handle, MouseButton::Right, lparam),
             WM_MBUTTONUP => self.handle_mouse_up_msg(handle, MouseButton::Middle, lparam),
             WM_XBUTTONUP => {
@@ -601,6 +645,115 @@ impl WindowsWindowInner {
         });
 
         Some(0)
+    }
+
+    /// rustyfiles: the left press. A finger's is held back until it is known to be a tap, a swipe or a drag (`touch_pan`).
+    fn handle_touch_press(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        let key = handle.0 as isize;
+        // (a press ends a fling that still runs: the list stops under the finger)
+        FLING.with(|m| m.borrow_mut().remove(&key));
+        let (x, y) = (lparam.signed_loword() as i32, lparam.signed_hiword() as i32);
+        let touch = crate::touch_pan::from_touch();
+        let held = TOUCH.with(|m| {
+            let mut m = m.borrow_mut();
+            // (no entry is made for a window that never saw a finger)
+            if touch { m.entry(key).or_default().press(x, y, lparam.0, true) } else { m.get_mut(&key).is_some_and(|p| p.press(x, y, lparam.0, false)) }
+        });
+        if !held {
+            return self.handle_mouse_down_msg(handle, MouseButton::Left, lparam);
+        }
+        // (the moves and the release come here even when the finger leaves the window)
+        unsafe { SetCapture(handle) };
+        Some(0)
+    }
+
+    /// rustyfiles: a move, while a finger's press is held or its swipe runs.
+    fn handle_touch_move(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
+        use crate::touch_pan::OnMove;
+        let key = handle.0 as isize;
+        if !TOUCH.with(|m| m.borrow().get(&key).is_some_and(|p| p.busy())) {
+            return self.handle_mouse_move_msg(handle, lparam, wparam);
+        }
+        let (x, y) = (lparam.signed_loword() as i32, lparam.signed_hiword() as i32);
+        let down = MODIFIERKEYS_FLAGS(wparam.loword() as u32).contains(MK_LBUTTON);
+        let scale_factor = self.state.scale_factor.get();
+        let (step, origin) = TOUCH.with(|m| {
+            let mut m = m.borrow_mut();
+            let p = m.entry(key).or_default();
+            (p.moved(x, y, down, crate::touch_pan::SLOP * scale_factor, touch_now_ms()), p.origin())
+        });
+        match step {
+            OnMove::Pass => {
+                if !down {
+                    unsafe { ReleaseCapture().log_err() };
+                }
+                self.handle_mouse_move_msg(handle, lparam, wparam)
+            }
+            OnMove::Swallow => Some(0),
+            OnMove::Release(held) => {
+                self.handle_mouse_down_msg(handle, MouseButton::Left, LPARAM(held));
+                self.handle_mouse_move_msg(handle, lparam, wparam)
+            }
+            OnMove::Scroll(way) => {
+                self.touch_scroll(origin, way, TouchPhase::Moved);
+                Some(0)
+            }
+        }
+    }
+
+    /// rustyfiles: the left release: a tap's click, the end of a swipe, or the app's own.
+    fn handle_touch_release(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        use crate::touch_pan::OnUp;
+        let key = handle.0 as isize;
+        let (step, origin) = TOUCH.with(|m| m.borrow_mut().get_mut(&key).map_or((OnUp::Pass, (0, 0)), |p| (p.release(touch_now_ms()), p.origin())));
+        match step {
+            OnUp::Pass => self.handle_mouse_up_msg(handle, MouseButton::Left, lparam),
+            OnUp::Tap(held) => {
+                self.handle_mouse_down_msg(handle, MouseButton::Left, LPARAM(held));
+                self.handle_mouse_up_msg(handle, MouseButton::Left, lparam)
+            }
+            OnUp::Swiped(speed) => {
+                unsafe { ReleaseCapture().log_err() };
+                if speed == 0.0 {
+                    self.touch_scroll(origin, 0.0, TouchPhase::Ended);
+                } else {
+                    let scale_factor = self.state.scale_factor.get();
+                    FLING.with(|m| {
+                        m.borrow_mut().insert(
+                            key,
+                            TouchFling {
+                                fling: crate::touch_pan::Fling { speed },
+                                position: logical_point(origin.0 as f32, origin.1 as f32, scale_factor),
+                                scale_factor,
+                                // so the very next frame already moves
+                                last: std::time::Instant::now() - std::time::Duration::from_millis(12),
+                            },
+                        )
+                    });
+                    crate::demand::request();
+                    unsafe {
+                        let _ = InvalidateRect(Some(handle), None, false);
+                    }
+                }
+                Some(0)
+            }
+        }
+    }
+
+    /// A swipe's scroll event: `way` physical pixels down, for what is under the place the finger came down at.
+    fn touch_scroll(&self, origin: (i32, i32), way: f32, phase: TouchPhase) {
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return;
+        };
+        let scale_factor = self.state.scale_factor.get();
+        func(PlatformInput::Scroll(ScrollEvent {
+            position: logical_point(origin.0 as f32, origin.1 as f32, scale_factor),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(way / scale_factor))),
+            modifiers: current_modifiers(),
+            touch_phase: phase,
+            source: ScrollSource::Pointer,
+        }));
+        self.state.callbacks.input.set(Some(func));
     }
 
     fn handle_mouse_down_msg(
@@ -1597,6 +1750,14 @@ impl WindowsWindowInner {
         }
         // rustyfiles: one step of a smooth wheel scroll per frame
         if let Some(event) = smooth_step(handle) {
+            if let Some(mut func) = self.state.callbacks.input.take() {
+                func(event);
+                self.state.callbacks.input.set(Some(func));
+            }
+            crate::demand::request();
+        }
+        // rustyfiles: and one of a finger's fling
+        if let Some(event) = fling_step(handle) {
             if let Some(mut func) = self.state.callbacks.input.take() {
                 func(event);
                 self.state.callbacks.input.set(Some(func));

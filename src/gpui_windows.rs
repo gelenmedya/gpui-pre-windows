@@ -20,6 +20,7 @@ mod platform;
 mod reentry;
 mod system_notifications;
 mod system_settings;
+mod touch_pan;
 mod util;
 mod vsync;
 mod window;
