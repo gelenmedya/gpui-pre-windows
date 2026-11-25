@@ -161,3 +161,7 @@ LEFT. The run callback placed every glyph at `width + advanceOffset`, left to ri
 in reverse order. Now an RTL run keeps a pen at the baseline origin and moves it left by each glyph's advance, placing the
 glyph at `pen - advance - advanceOffset`; an LTR run is placed as before. The line's measured width is unchanged (it adds
 the advances either way).
+
+## A lost device while windows open or close (`src/platform.rs`, 2026-11-25)
+- The recovery from a lost device and the renderer switch both send messages from the vsync thread to every window. They held the window list's lock across those sends; the UI thread takes that lock for writing when it opens or closes a window, so a window opened or closed in that moment stopped both threads for good. Seen when a display driver was updated while the rustyfiles dock was up (the monitors came back under new names and the dock closed and opened its windows). The handles are now copied first (`window_handles`) and the lock is let go before anything is sent.
+- `GPUI_TEST_DEVICE_LOST_MS=<ms>` runs that recovery every so many milliseconds without a lost device, for tests. With it and a menu opened and closed in a loop, the old code hung within ten rounds; the new code ran 120.

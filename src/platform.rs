@@ -490,6 +490,13 @@ impl WindowsPlatform {
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
+                // A test's way to run the recovery from a lost device without losing one: every so many milliseconds
+                // (`GPUI_TEST_DEVICE_LOST_MS`). Nothing reads the clock when the variable is not set.
+                let test_lost_every = std::env::var("GPUI_TEST_DEVICE_LOST_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(std::time::Duration::from_millis);
+                let mut test_lost_at = std::time::Instant::now();
                 loop {
                     // rustyfiles fork (demand.rs): park while nothing needs drawing.
                     let signal_source = if crate::demand::idle() {
@@ -502,8 +509,16 @@ impl WindowsPlatform {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
+                    let test_lost = test_lost_every.is_some_and(|every| {
+                        let due = test_lost_at.elapsed() >= every;
+                        if due {
+                            test_lost_at = std::time::Instant::now();
+                        }
+                        due
+                    });
                     if check_device_lost(&directx_device.device)
                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
+                        || test_lost
                     {
                         if let Err(err) = handle_gpu_device_lost(
                             &mut directx_device,
@@ -1829,6 +1844,17 @@ fn is_window_station_visible() -> bool {
     result.is_ok() && flags.dwFlags & WSF_VISIBLE as u32 != 0
 }
 
+/// The windows as they are now, for a thread that is about to send them messages.
+///
+/// The list's lock is NOT kept while the messages are sent. `SendMessageW` waits for the UI thread, and the UI thread takes the same
+/// lock for writing whenever it opens or closes a window: with the lock held across the sends, a window opened or closed while a
+/// lost device was being recovered (or the renderer switched) stopped both threads for good. That is what happened when a display
+/// driver was updated while a dock was up: the monitors came back under new names, the dock closed and opened its windows for them,
+/// and the process hung. A window that is closed after this list was made simply does not answer.
+fn window_handles(all_windows: &RwLock<SmallVec<[TrackedWindow; 4]>>) -> SmallVec<[SafeHwnd; 4]> {
+    all_windows.read().iter().map(|window| window.handle).collect()
+}
+
 fn handle_gpu_device_lost(
     directx_devices: &mut DirectXDevices,
     platform_window: HWND,
@@ -1859,7 +1885,7 @@ fn handle_gpu_device_lost(
         text_system.handle_gpu_lost(&directx_devices)?;
     }
     if let Some(all_windows) = all_windows.upgrade() {
-        for window in all_windows.read().iter() {
+        for window in window_handles(&all_windows) {
             unsafe {
                 SendMessageW(
                     window.as_raw(),
@@ -1870,7 +1896,7 @@ fn handle_gpu_device_lost(
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
-        for window in all_windows.read().iter() {
+        for window in window_handles(&all_windows) {
             unsafe {
                 SendMessageW(
                     window.as_raw(),
@@ -1908,7 +1934,7 @@ fn switch_backend(
     new_devices.graceful_switch = true;
     let lparam = LPARAM(&new_devices as *const _ as _);
     let mut failed = false;
-    for window in all_windows.read().iter() {
+    for window in window_handles(&all_windows) {
         let result = unsafe {
             SendMessageW(
                 window.as_raw(),
@@ -1945,7 +1971,7 @@ fn switch_backend(
     }
 
     // 3. Forced redraw: renders the first frame on the new device, then commits it.
-    for window in all_windows.read().iter() {
+    for window in window_handles(&all_windows) {
         unsafe {
             SendMessageW(
                 window.as_raw(),
